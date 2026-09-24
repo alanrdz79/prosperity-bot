@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 from core.config.session_config import API_KEY, API_SECRET, SYMBOL, TIMEFRAME, CAPITAL_BASE_INICIAL
 from decision.session_scheduler import SessionScheduler
-from risk.dynamic_leverage import DynamicLeverageSizer
+from risk.adaptive_leverage_sizer import AdaptiveLeverageSizer
 
 class ProsperityFuturesRunner:
     def __init__(self):
@@ -20,7 +20,11 @@ class ProsperityFuturesRunner:
         })
         self.exchange.set_sandbox_mode(True)
         self.scheduler = SessionScheduler()
-        self.sizer = DynamicLeverageSizer()
+        self.sizer = AdaptiveLeverageSizer()
+        
+        # Estado de la cuenta para control de rachas (RiskManager simplificado)
+        self.consecutive_losses = 0
+        self.current_atr_ratio = 1.0
 
     def inicializar(self):
         """Prepara conexión, apalancamiento y tipo de margen."""
@@ -59,21 +63,31 @@ class ProsperityFuturesRunner:
     def evaluar_estrategia(self, estrategia: str) -> bool:
         """Calcula indicadores según la sesión activa y retorna si hay entrada."""
         try:
-            ohlcv = self.exchange.fetch_ohlcv(SYMBOL, timeframe=TIMEFRAME, limit=60)
+            ohlcv = self.exchange.fetch_ohlcv(SYMBOL, timeframe=TIMEFRAME, limit=100)
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             
+            # Bandas y Medias
             df['ema_20'] = df['close'].ewm(span=20, adjust=False).mean()
             df['std'] = df['close'].rolling(window=20).std()
             df['upper_band'] = df['ema_20'] + (df['std'] * 2.0)
             df['lower_band'] = df['ema_20'] - (df['std'] * 2.0)
             df['vol_promedio'] = df['volume'].rolling(window=20).mean()
 
+            # Cálculo de volatilidad instantánea (ATR Ratio)
+            df['tr'] = df['high'] - df['low']
+            df['atr_14'] = df['tr'].rolling(14).mean()
+            df['atr_mean_50'] = df['atr_14'].rolling(50).mean()
+            
+            atr_actual = df['atr_14'].iloc[-1]
+            atr_medio = df['atr_mean_50'].iloc[-1]
+            self.current_atr_ratio = atr_actual / atr_medio if pd.notnull(atr_medio) and atr_medio > 0 else 1.0
+
             precio = df['close'].iloc[-1]
             vol_actual = df['volume'].iloc[-1]
             vol_medio = df['vol_promedio'].iloc[-1]
 
             hora_str = datetime.now(timezone.utc).strftime('%H:%M:%S')
-            print(f"[{hora_str} UTC] Modo: {estrategia} | Precio: ${precio:.2f} | Vol Ratio: {vol_actual/vol_medio:.2f}x")
+            print(f"[{hora_str} UTC] Modo: {estrategia} | Precio: ${precio:.2f} | Vol Ratio: {vol_actual/vol_medio:.2f}x | ATR Ratio: {self.current_atr_ratio:.2f}")
 
             # Estrategia de Gran Solapamiento: Ruptura con volumen
             if estrategia == "BREAKOUT_MOMENTUM_NY":
@@ -97,13 +111,23 @@ class ProsperityFuturesRunner:
             ticker = self.exchange.fetch_ticker(SYMBOL)
             precio_actual = float(ticker['last'])
 
-            params_trade = self.sizer.calculate_trade_parameters(balance, precio_actual)
+            # Uso del AdaptiveLeverageSizer
+            params_trade = self.sizer.calculate_leverage_and_sizing(
+                current_balance=balance, 
+                current_price=precio_actual,
+                atr_ratio=self.current_atr_ratio,
+                consecutive_losses=self.consecutive_losses
+            )
+            
             leverage = params_trade['leverage']
+            motivo = params_trade.get('reason', '')
             
             self.exchange.set_leverage(leverage, SYMBOL)
             cantidad_ajustada = float(self.exchange.amount_to_precision(SYMBOL, params_trade['units']))
             
-            print(f"\n🚀 [EJECUCIÓN] Enviando orden BUY de {cantidad_ajustada} {SYMBOL} (Apalancamiento: x{leverage})...")
+            print(f"\n🚀 [EJECUCIÓN] Enviando orden BUY de {cantidad_ajustada} {SYMBOL} (Apalancamiento: x{leverage})")
+            print(f"   => AdaptiveRisk: {motivo}")
+            
             orden = self.exchange.create_order(SYMBOL, 'market', 'buy', cantidad_ajustada)
             precio_llenado = float(orden.get('average') or precio_actual)
 
@@ -149,6 +173,6 @@ class ProsperityFuturesRunner:
 if __name__ == "__main__":
     runner = ProsperityFuturesRunner()
     if runner.inicializar():
-        print("Iniciando orquestador institucional de PROSPERITY...")
+        print("Iniciando orquestador institucional de PROSPERITY con AdaptiveLeverageSizer...")
         while True:
             runner.ejecutar_ciclo()
