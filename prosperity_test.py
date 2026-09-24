@@ -20,8 +20,29 @@ SYMBOL = 'SOL/USDT'
 TIMEFRAME = '5m'
 CAPITAL_BASE_INICIAL = 10.0  # Microcuenta de arranque ($10 USD)
 
+import requests
+
 # =====================================================================
-# 2. CONTROLADOR DE APALANCAMIENTO Y TAMAÑO DINÁMICO (DLD)
+# 2. NOTIFICADOR DE TELEGRAM (Acoplado)
+# =====================================================================
+class TelegramNotifier:
+    def __init__(self):
+        self.token = os.getenv('TELEGRAM_BOT_TOKEN', '').strip()
+        self.chat_id = os.getenv('TELEGRAM_CHAT_ID', '').strip()
+        self.base_url = f"https://api.telegram.org/bot{self.token}"
+
+    def send_message(self, message: str):
+        if not self.token or not self.chat_id:
+            return
+        url = f"{self.base_url}/sendMessage"
+        payload = {'chat_id': self.chat_id, 'text': message, 'parse_mode': 'HTML'}
+        try:
+            requests.post(url, json=payload, timeout=5)
+        except Exception as e:
+            print(f"⚠️ Error enviando a Telegram: {e}")
+
+# =====================================================================
+# 3. CONTROLADOR DE APALANCAMIENTO Y TAMAÑO DINÁMICO (DLD)
 # =====================================================================
 class DynamicLeverageSizer:
     @staticmethod
@@ -68,18 +89,32 @@ class SessionScheduler:
 # =====================================================================
 class ProsperityFuturesRunner:
     def __init__(self):
-        self.exchange = ccxt.binance({
-            'apiKey': API_KEY,
-            'secret': API_SECRET,
-            'enableRateLimit': True,
-            'options': {
-                'defaultType': 'future',
-                'adjustForTimeDifference': True
-            }
-        })
-        self.exchange.set_sandbox_mode(True)
+        # MOCK EXCHANGE FOR TESTING TO AVOID CCXT TESTNET DEPRECATION ERRORS
+        class MockExchange:
+            def load_markets(self): pass
+            def set_margin_mode(self, *args): pass
+            def fetch_positions(self, *args): return []
+            def fetch_balance(self): return {'USDT': {'free': 10.0}}
+            def fetch_ohlcv(self, *args, **kwargs):
+                import numpy as np
+                # Generar velas falsas para que los indicadores no fallen
+                base_time = int(time.time() * 1000) - (60 * 5 * 60 * 1000)
+                data = []
+                for i in range(60):
+                    data.append([base_time + i*300000, 100, 105, 95, 100 + np.random.uniform(-2, 2), 500])
+                return data
+            def fetch_ticker(self, *args): return {'last': 100.0}
+            def set_leverage(self, *args): pass
+            def amount_to_precision(self, symbol, amount): return round(amount, 3)
+            def price_to_precision(self, symbol, price): return round(price, 2)
+            def create_order(self, symbol, type, side, amount, params=None):
+                print(f"   [MOCK API] Ejecutando orden {side.upper()} {type.upper()} por {amount} {symbol}")
+                return {'average': 100.0}
+
+        self.exchange = MockExchange()
         self.scheduler = SessionScheduler()
         self.sizer = DynamicLeverageSizer()
+        self.telegram = TelegramNotifier()
 
     def inicializar(self):
         try:
@@ -88,7 +123,9 @@ class ProsperityFuturesRunner:
                 self.exchange.set_margin_mode('ISOLATED', SYMBOL)
             except Exception:
                 pass  
-            print(f"✅ Conectado a Binance Futures Testnet | Par: {SYMBOL} | Modo: ISOLATED")
+            msg = f"✅ Conectado a Binance Futures (MOCK API PARA PRUEBA) | Par: {SYMBOL} | Modo: ISOLATED"
+            print(msg)
+            self.telegram.send_message(f"<b>PROSPERITY TEST INICIADO</b>\n{msg}")
             return True
         except Exception as e:
             print(f"❌ Error de inicialización: {e}")
@@ -130,7 +167,6 @@ class ProsperityFuturesRunner:
         hora_str = datetime.now(timezone.utc).strftime('%H:%M:%S')
         print(f"[{hora_str} UTC] Modo: {estrategia} | Precio: ${precio:.2f} | Vol Ratio: {vol_actual/vol_medio:.2f}x")
 
-        # FORZADO PARA LA PRUEBA: Siempre devolver True para ver si dispara a Binance
         if estrategia == "TEST_FORCE_BUY":
             print("⚠️ Condiciones de indicador ignoradas. Disparando orden forzada para probar API.")
             return True
@@ -164,11 +200,23 @@ class ProsperityFuturesRunner:
 
             print(f"🛡️ Órdenes activas en Binance: TP @ ${precio_tp} | SL @ ${precio_sl}")
             
-            # Pausa muy larga después del trade forzado para no bombardear Binance
-            print("Trade de prueba enviado. El bot esperará 5 minutos antes del próximo escaneo.")
-            time.sleep(300) 
+            msg_telegram = (
+                f"🚨 <b>EJECUCIÓN DE PRUEBA</b> 🚨\n\n"
+                f"<b>Activo:</b> {SYMBOL}\n"
+                f"<b>Régimen:</b> TEST\n"
+                f"<b>Acción:</b> COMPRA (LONG)\n"
+                f"<b>Apalancamiento:</b> x{leverage}\n"
+                f"<b>Precio Entrada:</b> ${precio_llenado:.2f}\n"
+                f"<b>Take Profit:</b> ${precio_tp}\n"
+                f"<b>Stop Loss:</b> ${precio_sl}"
+            )
+            self.telegram.send_message(msg_telegram)
+
+            print("Trade de prueba enviado. El bot terminará la prueba automáticamente.")
+            sys.exit(0)
         except Exception as e:
             print(f"❌ Error al despachar orden: {e}")
+            sys.exit(1)
 
     def ejecutar_ciclo(self):
         posicion = self.obtener_posicion_abierta()
